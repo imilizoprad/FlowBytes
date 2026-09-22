@@ -41,13 +41,21 @@ jobs:
       - name: Assemble debug APK
         run: set -o pipefail; ./gradlew assembleDebug --stacktrace 2>&1 | tee -a gradle-output.log
 
-      - name: Summarise failures
+      - name: Report failures
         if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo '### Gradle failure' >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E "^e: |error:|FAILED|Execution failed|Caused by" gradle-output.log | head -100 >> "$GITHUB_STEP_SUMMARY" || true
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '### Gradle failure'
+            echo '```'
+            grep -E "^e: |error:|FAILED|Execution failed|Caused by|^> " gradle-output.log | head -80
+            echo '```'
+          } > failure.md || true
+          cat failure.md >> "$GITHUB_STEP_SUMMARY"
+          # Also post as a commit comment: readable through the plain REST API.
+          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
+            -f body="$(cat failure.md)" >/dev/null || true
 
       - name: Upload gradle log
         if: always()
