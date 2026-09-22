@@ -52,7 +52,7 @@ jobs:
           {
             echo '### Gradle failure'
             echo '```'
-            grep -E "^e: |error:|FAILED|Execution failed|Caused by|^> " gradle-output.log | head -80
+            grep -vE "^(Download|> Task .*(UP-TO-DATE|NO-SOURCE))" gradle-output.log | tail -120
             echo '```'
           } > failure.md || true
           cat failure.md >> "$GITHUB_STEP_SUMMARY"
