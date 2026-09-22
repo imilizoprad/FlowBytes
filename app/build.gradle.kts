@@ -37,10 +37,17 @@ android {
                 keystoreProperties.load(FileInputStream(keystorePropertiesFile))
             }
 
-            storeFile = file(keystoreProperties.getProperty("RELEASE_STORE_FILE") ?: "")
-            storePassword = keystoreProperties.getProperty("RELEASE_STORE_PASSWORD") ?: ""
-            keyAlias = keystoreProperties.getProperty("RELEASE_KEY_ALIAS") ?: ""
-            keyPassword = keystoreProperties.getProperty("RELEASE_KEY_PASSWORD") ?: ""
+            // Only wire up signing when a keystore is actually configured. Without this guard
+            // the whole build script fails to configure on machines/CI that have no
+            // local.properties (Gradle cannot convert an empty string to a File), which breaks
+            // even debug builds and unit tests.
+            val storePath = keystoreProperties.getProperty("RELEASE_STORE_FILE").orEmpty()
+            if (storePath.isNotBlank()) {
+                storeFile = file(storePath)
+                storePassword = keystoreProperties.getProperty("RELEASE_STORE_PASSWORD").orEmpty()
+                keyAlias = keystoreProperties.getProperty("RELEASE_KEY_ALIAS").orEmpty()
+                keyPassword = keystoreProperties.getProperty("RELEASE_KEY_PASSWORD").orEmpty()
+            }
         }
     }
     buildTypes {
@@ -51,7 +58,8 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("release")
+            // Fall back to unsigned output when no keystore is present (CI, fresh clones).
+            signingConfig = signingConfigs.getByName("release").takeIf { it.storeFile != null }
             ndk {
                 debugSymbolLevel = "FULL"
             }
