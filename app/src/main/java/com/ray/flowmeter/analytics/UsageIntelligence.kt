@@ -150,11 +150,13 @@ object UsageIntelligence {
         val remaining = period - elapsed
 
         val hoursElapsed = elapsed.toDouble() / HOUR_MS
+        // Floored away from zero: at the very start of a period there is nothing to extrapolate
+        // from, and dividing by it would produce NaN/Infinity that poisons every downstream value.
         val fractionElapsed = if (period <= 24 * HOUR_MS) {
             expectedFractionElapsed(hourlyProfile, periodStartHour, hoursElapsed)
         } else {
-            (elapsed.toDouble() / period).coerceIn(0.0001, 1.0)
-        }
+            elapsed.toDouble() / period
+        }.coerceIn(0.0001, 1.0)
 
         // Shape-aware projection.
         val shapeProjection = usedBytes / fractionElapsed

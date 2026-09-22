@@ -41,6 +41,12 @@ jobs:
       - name: Run unit tests
         run: set -o pipefail; ./gradlew testDebugUnitTest --stacktrace 2>&1 | tee -a gradle-output.log
 
+      - name: Extract test failure details
+        if: failure()
+        run: |
+          grep -h -A6 -E "<failure|<error" app/build/test-results/testDebugUnitTest/*.xml \
+            | head -80 >> gradle-output.log || true
+
       - name: Assemble debug APK
         run: set -o pipefail; ./gradlew assembleDebug --stacktrace 2>&1 | tee -a gradle-output.log
 
