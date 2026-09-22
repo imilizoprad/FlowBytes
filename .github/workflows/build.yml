@@ -36,10 +36,26 @@ jobs:
         run: chmod +x ./gradlew
 
       - name: Run unit tests
-        run: ./gradlew testDebugUnitTest --stacktrace
+        run: set -o pipefail; ./gradlew testDebugUnitTest --stacktrace 2>&1 | tee -a gradle-output.log
 
       - name: Assemble debug APK
-        run: ./gradlew assembleDebug --stacktrace
+        run: set -o pipefail; ./gradlew assembleDebug --stacktrace 2>&1 | tee -a gradle-output.log
+
+      - name: Summarise failures
+        if: failure()
+        run: |
+          echo '### Gradle failure' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E "^e: |error:|FAILED|Execution failed|Caused by" gradle-output.log | head -100 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload gradle log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-output-log
+          path: gradle-output.log
+          if-no-files-found: ignore
 
       - name: Upload test report
         if: always()
