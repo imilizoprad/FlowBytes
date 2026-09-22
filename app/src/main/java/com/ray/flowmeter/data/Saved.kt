@@ -100,10 +100,56 @@ interface AppLimitDao {
     suspend fun getAppLimit(packageName: String): AppLimit?
 }
 
-@Database(entities = [AppAlert::class, AppLimit::class], version = 8, exportSchema = false)
+/**
+ * One completed hour of device-wide usage, persisted locally.
+ *
+ * Android's NetworkStatsManager only retains a couple of weeks of detail, and it is expensive
+ * to query repeatedly. Rolling completed hours into this table gives FlowBytes long-range
+ * history for forecasting, weekday/weekend profiling and anomaly detection at essentially zero
+ * query cost — one row per hour is ~9 KB/year.
+ */
+@Entity(tableName = "usage_hours")
+data class UsageHour(
+    /** Epoch millis of the start of the hour; unique, so re-ingesting an hour is idempotent. */
+    @PrimaryKey val hourStart: Long,
+    val mobileBytes: Long,
+    val wifiBytes: Long,
+    /** 0..23 in the local timezone at the moment of capture. */
+    val hourOfDay: Int,
+    /** 1 = Sunday .. 7 = Saturday (matches Calendar.DAY_OF_WEEK). */
+    val dayOfWeek: Int,
+)
+
+@Dao
+interface UsageHourDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAll(hours: List<UsageHour>)
+
+    @Query("SELECT * FROM usage_hours WHERE hourStart >= :since ORDER BY hourStart ASC")
+    suspend fun since(since: Long): List<UsageHour>
+
+    @Query("SELECT * FROM usage_hours WHERE hourStart >= :since ORDER BY hourStart ASC")
+    fun observeSince(since: Long): Flow<List<UsageHour>>
+
+    @Query("SELECT MAX(hourStart) FROM usage_hours")
+    suspend fun latestHourStart(): Long?
+
+    @Query("DELETE FROM usage_hours WHERE hourStart < :before")
+    suspend fun pruneBefore(before: Long)
+
+    @Query("DELETE FROM usage_hours")
+    suspend fun deleteAll()
+}
+
+@Database(
+    entities = [AppAlert::class, AppLimit::class, UsageHour::class],
+    version = 9,
+    exportSchema = false,
+)
 abstract class FlowMeterDatabase : RoomDatabase() {
     abstract fun appAlertDao(): AppAlertDao
     abstract fun appLimitDao(): AppLimitDao
+    abstract fun usageHourDao(): UsageHourDao
 
     companion object {
         @Volatile

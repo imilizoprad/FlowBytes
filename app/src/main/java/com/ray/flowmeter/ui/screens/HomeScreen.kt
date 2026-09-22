@@ -31,6 +31,7 @@ import androidx.compose.ui.unit.sp
 import com.ray.flowmeter.R
 import com.ray.flowmeter.ui.components.AppIcons
 import com.ray.flowmeter.ui.components.ChartType
+import com.ray.flowmeter.ui.components.InsightsCard
 import com.ray.flowmeter.ui.components.WeeklyBarChart
 import com.ray.flowmeter.ui.theme.StaggeredEntrance
 import com.ray.flowmeter.ui.theme.bounceClick
@@ -44,6 +45,7 @@ import android.provider.Settings
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.ray.flowmeter.utils.PermissionHelper
 import android.os.Build
 import androidx.compose.material.icons.rounded.Notifications
@@ -57,6 +59,7 @@ fun HomeScreen(
     onNavigateToMonthUsage: (Offset?) -> Unit = {},
 ) {
     val selectedChartType by viewModel.selectedChartType
+    val insights by viewModel.insights.collectAsStateWithLifecycle()
 
     val context = androidx.compose.ui.platform.LocalContext.current
     var hasUsageAccess by remember { mutableStateOf(PermissionHelper.hasUsageAccess(context)) }
@@ -318,6 +321,10 @@ fun HomeScreen(
         }
 
         item {
+            InsightsCard(insights = insights, staggerIndex = 2)
+        }
+
+        item {
             var monthCardCenter by remember { mutableStateOf(Offset.Zero) }
             UsageSummaryCard(
                 title = stringResource(R.string.label_this_month),
@@ -332,7 +339,7 @@ fun HomeScreen(
                     monthCardCenter = coordinates.boundsInRoot().center
                 },
                 onClick = { onNavigateToMonthUsage(monthCardCenter) },
-                staggerIndex = 2
+                staggerIndex = 3
             )
         }
     }

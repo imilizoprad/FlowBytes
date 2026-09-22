@@ -491,4 +491,28 @@
     <string name="unit_hours">Hours</string>
     <string name="unit_min_short">Min</string>
     <string name="unit_sec_short">Sec</string>
+    <!-- Smart Insights -->
+    <string name="label_smart_insights">Smart Insights</string>
+    <string name="insight_learning">Learning your habits… insights appear after about a day of monitoring.</string>
+    <string name="insight_projected_today">Projected today</string>
+    <string name="insight_projected_month">Projected this month</string>
+    <string name="insight_confidence">%1$d%% confidence</string>
+    <string name="insight_range">Range %1$s – %2$s</string>
+    <string name="insight_risk_safe">Comfortably within your limit</string>
+    <string name="insight_risk_on_track">On track, with little headroom</string>
+    <string name="insight_risk_watch">Likely to exceed your limit</string>
+    <string name="insight_risk_at_risk">You will run out of data</string>
+    <string name="insight_risk_exceeded">Limit already exceeded</string>
+    <string name="insight_exhaustion_at">Data runs out around %1$s</string>
+    <string name="insight_budget_per_hour">Stay under %1$s per hour to make it</string>
+    <string name="insight_busiest_hour">Busiest hour: %1$s</string>
+    <string name="insight_trend_up">Up %1$d%% versus last week</string>
+    <string name="insight_trend_down">Down %1$d%% versus last week</string>
+    <string name="insight_trend_flat">Usage is steady versus last week</string>
+    <string name="insight_anomaly">Unusual spike on %1$s: %2$s (typical is %3$s)</string>
+    <string name="insight_leak">Possible background drain: %1$s used during your usual quiet hours</string>
+    <string name="insight_suggest_daily">Suggested daily limit: %1$s</string>
+    <string name="insight_suggest_monthly">Suggested monthly limit: %1$s</string>
+    <string name="insight_apply_suggestion">Apply</string>
+    <string name="insight_weekday_weekend">Weekdays %1$s · Weekends %2$s</string>
 </resources>

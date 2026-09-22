@@ -39,6 +39,9 @@ import com.ray.flowmeter.data.AppLimitRepository
 import com.ray.flowmeter.data.FlowMeterDatabase
 import com.ray.flowmeter.data.UserPreferencesRepository
 import com.ray.flowmeter.receiver.NetworkWakeupReceiver
+import com.ray.flowmeter.analytics.InsightsEngine
+import com.ray.flowmeter.analytics.UsageIntelligence
+import com.ray.flowmeter.utils.NetworkStatsCache
 import com.ray.flowmeter.utils.SpeedFormatter
 import kotlin.time.Duration.Companion.milliseconds
 import kotlinx.coroutines.CoroutineScope
@@ -77,6 +80,12 @@ class NetworkMonitoringService : Service() {
         private const val SUMMARY_ID = 99
 
         private const val ALERT_GROUP_KEY = "high_traffic_group"
+
+        /** Below this speed the link counts as idle for adaptive-poll backoff. */
+        private const val IDLE_SPEED_BYTES = 8L * 1024L
+
+        /** Completed hours are folded into local history at most this often. */
+        private const val HISTORY_INGEST_INTERVAL_MS = 15L * 60L * 1000L
     }
 
     private var lastRxBytes: Long = 0
@@ -96,6 +105,10 @@ class NetworkMonitoringService : Service() {
     private var cachedCustomWifiUsage: Long = 0
     private var cachedCustomMobileUsage: Long = 0
     private var lastUsageQueryTime: Long = 0
+    private var lastHistoryIngestTime: Long = 0
+
+    /** Consecutive monitor ticks with no meaningful traffic; drives the adaptive poll rate. */
+    private var idleTicks: Int = 0
 
     private var hasAlertedData = false
     private var hasAlertedWifi = false
@@ -154,6 +167,8 @@ class NetworkMonitoringService : Service() {
     private var trafficAlertCooldown: Long = 600_000L
     private var trafficResetBelowThresholdTime: Long = 5_000L
     private var trafficResetSpeed: Long = 200_000L
+
+    private val insightsEngine: InsightsEngine by lazy { InsightsEngine(applicationContext) }
 
     private val alertRepository: AlertRepository by lazy { AlertRepository(FlowMeterDatabase.getDatabase(applicationContext).appAlertDao()) }
     private val appLimitRepository: AppLimitRepository by lazy { AppLimitRepository(FlowMeterDatabase.getDatabase(applicationContext).appLimitDao()) }
@@ -292,22 +307,47 @@ class NetworkMonitoringService : Service() {
 
     private fun startMonitoring() {
         if (monitorJob?.isActive == true) return
-        
+
         monitorJob = serviceScope.launch {
             while (isActive) {
                 val now = System.currentTimeMillis()
-                if ((now - lastUsageQueryTime) > 2000) {
+                val connected = isNetworkConnected()
+
+                // Heavy NetworkStats work is throttled independently of the light speed tick:
+                // it is only genuinely useful a few times a minute, and it is ~100x more
+                // expensive than reading TrafficStats counters.
+                val usageInterval = if (isScreenOn) 5_000L else 60_000L
+                if ((now - lastUsageQueryTime) > usageInterval) {
                     updateDailyUsage()
                     checkAppLimits()
                 }
 
-                if (isScreenOn) {
+                if (isScreenOn || connected) {
                     updateStats()
-                    delay(1000.milliseconds)
-                } else {
-                    // Slow down loop when screen is off to save battery
-                    delay(10000.milliseconds)
                 }
+
+                // Roll completed hours into local history for the analytics engine.
+                if ((now - lastHistoryIngestTime) > HISTORY_INGEST_INTERVAL_MS) {
+                    lastHistoryIngestTime = now
+                    launch(Dispatchers.IO) {
+                        try {
+                            insightsEngine.ingestCompletedHours()
+                        } catch (_: Exception) {
+                            // History is best-effort; never let it take the service down.
+                        }
+                    }
+                }
+
+                // Track how long the link has been quiet so the poll rate can decay.
+                idleTicks = if (currentTotalSpeed > IDLE_SPEED_BYTES) 0 else (idleTicks + 1).coerceAtMost(1000)
+
+                val interval = UsageIntelligence.adaptivePollIntervalMillis(
+                    screenOn = isScreenOn,
+                    currentSpeedBytesPerSec = currentTotalSpeed,
+                    idleTicks = idleTicks,
+                    connected = connected,
+                )
+                delay(interval.milliseconds)
             }
         }
     }
@@ -338,7 +378,6 @@ class NetworkMonitoringService : Service() {
 
     private suspend fun updateDailyUsage() = withContext(Dispatchers.IO) {
         try {
-            val networkStatsManager = getSystemService(NetworkStatsManager::class.java)
             val calendar = Calendar.getInstance()
             val currentTime = System.currentTimeMillis()
 
@@ -368,22 +407,15 @@ class NetworkMonitoringService : Service() {
                 return startTime
             }
 
-            fun getSumUsage(transportType: Int, period: String): Long {
-                var total = 0L
-                val start = getStartTime(period)
-                try {
-                    val stats = networkStatsManager.querySummary(transportType, null, start, currentTime)
-                    val bucket = NetworkStats.Bucket()
-                    while (stats.hasNextBucket()) {
-                        stats.getNextBucket(bucket)
-                        total += bucket.rxBytes + bucket.txBytes
-                    }
-                    stats.close()
-                } catch (_: Exception) {
-                    // ignore
-                }
-                return total
-            }
+            // Goes through the shared cache: the Home screen, widgets and this service all ask
+            // for the same windows, and one binder round-trip now serves all of them.
+            suspend fun getSumUsage(transportType: Int, period: String): Long =
+                NetworkStatsCache.summary(
+                    applicationContext,
+                    transportType,
+                    getStartTime(period),
+                    currentTime,
+                ).total
 
             cachedWifiUsage = getSumUsage(NetworkCapabilities.TRANSPORT_WIFI, "daily")
             cachedMobileUsage = getSumUsage(NetworkCapabilities.TRANSPORT_CELLULAR, "daily")
@@ -395,22 +427,12 @@ class NetworkMonitoringService : Service() {
             val wifiCustomStart = repository.wifiCustomLimitStart.first()
             val wifiCustomEnd = repository.wifiCustomLimitEnd.first()
 
-            fun getCustomSumUsage(transportType: Int, start: Long, end: Long): Long {
-                var total = 0L
-                try {
-                    val queryEnd = end.coerceAtMost(currentTime)
-                    val queryStart = start.coerceAtMost(queryEnd)
-                    val stats = networkStatsManager.querySummary(transportType, null, queryStart, queryEnd)
-                    val bucket = NetworkStats.Bucket()
-                    while (stats.hasNextBucket()) {
-                        stats.getNextBucket(bucket)
-                        total += bucket.rxBytes + bucket.txBytes
-                    }
-                    stats.close()
-                } catch (_: Exception) {
-                    // ignore
-                }
-                return total
+            suspend fun getCustomSumUsage(transportType: Int, start: Long, end: Long): Long {
+                val queryEnd = end.coerceAtMost(currentTime)
+                val queryStart = start.coerceAtMost(queryEnd)
+                return NetworkStatsCache.summary(
+                    applicationContext, transportType, queryStart, queryEnd,
+                ).total
             }
 
             cachedCustomMobileUsage = getCustomSumUsage(NetworkCapabilities.TRANSPORT_CELLULAR, dataCustomStart, dataCustomEnd)
@@ -1220,6 +1242,18 @@ class NetworkMonitoringService : Service() {
 
         val pm = packageManager
 
+        // Per-window UID tables, built lazily and shared by every limit in this pass.
+        //
+        // Previously each app ran two full querySummary() scans of its own, so N configured
+        // limits meant 2N binder calls and 2N walks over every bucket on the device. Limits
+        // almost always share the same daily/monthly window, so one scan per (window, transport)
+        // now serves all of them: O(windows) instead of O(apps).
+        val uidTables = HashMap<Triple<Long, Long, Int>, Map<Int, Long>>()
+        fun uidTable(start: Long, end: Long, transport: Int): Map<Int, Long> =
+            uidTables.getOrPut(Triple(start, end, transport)) {
+                buildUidUsageTable(networkStatsManager, transport, start, end)
+            }
+
         for (limit in limits) {
             try {
                 if (!limit.isEnabled) {
@@ -1275,8 +1309,8 @@ class NetworkMonitoringService : Service() {
                 val info = pm.getApplicationInfo(limit.packageName, 0)
                 val uid = info.uid
                 
-                val wifiUsage = getUidUsageForTransport(networkStatsManager, uid, startTime, currentTime, NetworkCapabilities.TRANSPORT_WIFI)
-                val mobileUsage = getUidUsageForTransport(networkStatsManager, uid, startTime, currentTime, NetworkCapabilities.TRANSPORT_CELLULAR)
+                val wifiUsage = uidTable(startTime, currentTime, NetworkCapabilities.TRANSPORT_WIFI)[uid] ?: 0L
+                val mobileUsage = uidTable(startTime, currentTime, NetworkCapabilities.TRANSPORT_CELLULAR)[uid] ?: 0L
                 
                 val currentUsage = when (limit.networkType) {
                     "wifi" -> wifiUsage
@@ -1327,22 +1361,27 @@ class NetworkMonitoringService : Service() {
         }
     }
 
-    private fun getUidUsageForTransport(nsm: NetworkStatsManager, uid: Int, startTime: Long, endTime: Long, transport: Int): Long {
-        var total = 0L
+    /** One pass over the buckets of a window, producing usage for every UID at once. */
+    private fun buildUidUsageTable(
+        nsm: NetworkStatsManager?,
+        transport: Int,
+        startTime: Long,
+        endTime: Long,
+    ): Map<Int, Long> {
+        if (nsm == null || endTime <= startTime) return emptyMap()
+        val table = HashMap<Int, Long>()
         try {
             val stats = nsm.querySummary(transport, null, startTime, endTime)
             val bucket = NetworkStats.Bucket()
             while (stats.hasNextBucket()) {
                 stats.getNextBucket(bucket)
-                if (bucket.uid == uid) {
-                    total += bucket.rxBytes + bucket.txBytes
-                }
+                table[bucket.uid] = (table[bucket.uid] ?: 0L) + bucket.rxBytes + bucket.txBytes
             }
             stats.close()
         } catch (_: Exception) {
             // ignore
         }
-        return total
+        return table
     }
 
     private fun sendAppLimitAlert(limit: AppLimit) {

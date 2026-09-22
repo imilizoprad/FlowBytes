@@ -1,7 +1,5 @@
 package com.ray.flowmeter.ui.viewmodels
 
-import android.app.usage.NetworkStats
-import android.app.usage.NetworkStatsManager
 import android.content.Context
 import android.net.NetworkCapabilities
 import androidx.compose.runtime.State
@@ -23,7 +21,13 @@ import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
+import com.ray.flowmeter.utils.NetworkStatsCache
 import com.ray.flowmeter.utils.SpeedFormatter
+import com.ray.flowmeter.analytics.Insights
+import com.ray.flowmeter.analytics.InsightsEngine
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 // ViewModel for the Home screen, managing usage stats and chart data
 class HomeViewModel(
     private val applicationContext: Context,
@@ -56,6 +60,14 @@ class HomeViewModel(
 
     private var _selectedChartType = mutableStateOf(ChartType.COMBINED)
     val selectedChartType: State<ChartType> = _selectedChartType
+
+    private val insightsEngine = InsightsEngine(applicationContext)
+
+    private val _insights = MutableStateFlow(Insights.EMPTY)
+    /** Latest analytics snapshot: forecasts, anomalies, suggestions and habit profile. */
+    val insights: StateFlow<Insights> = _insights.asStateFlow()
+
+    private var insightsJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -103,7 +115,6 @@ class HomeViewModel(
             val resetHour = repository.resetTimeHour.first()
             val resetMinute = repository.resetTimeMinute.first()
 
-            val networkStatsManager = applicationContext.getSystemService(Context.NETWORK_STATS_SERVICE) as NetworkStatsManager
             val calendar = Calendar.getInstance()
 
             val currentTime = System.currentTimeMillis()
@@ -130,11 +141,11 @@ class HomeViewModel(
             }
             val startTimeMonth = monthCalendar.timeInMillis
 
-            val dailyBytesArray = getDeviceUsage(networkStatsManager, startTimeDay, currentTime)
+            val dailyBytesArray = getDeviceUsage(startTimeDay, currentTime)
             val dailyBytes = dailyBytesArray[0] + dailyBytesArray[1]
 
-            val mDaily = getSumUsageForTransport(networkStatsManager, NetworkCapabilities.TRANSPORT_CELLULAR, startTimeDay, currentTime)
-            val wDaily = getSumUsageForTransport(networkStatsManager, NetworkCapabilities.TRANSPORT_WIFI, startTimeDay, currentTime)
+            val mDaily = getSumUsageForTransport(NetworkCapabilities.TRANSPORT_CELLULAR, startTimeDay, currentTime)
+            val wDaily = getSumUsageForTransport(NetworkCapabilities.TRANSPORT_WIFI, startTimeDay, currentTime)
 
             val timeElapsedMillis = (currentTime - startTimeDay).coerceAtLeast(1000L)
             val dayMillis = 24 * 60 * 60 * 1000L
@@ -143,11 +154,11 @@ class HomeViewModel(
             val dataLimitEnabled = repository.dataDailyLimitEnabled.first()
             val dataLimit = repository.dataDailyLimit.first()
 
-            val monthlyBytesArray = getDeviceUsage(networkStatsManager, startTimeMonth, currentTime)
+            val monthlyBytesArray = getDeviceUsage(startTimeMonth, currentTime)
             val monthlyBytes = monthlyBytesArray[0] + monthlyBytesArray[1]
 
-            val mMonthly = getSumUsageForTransport(networkStatsManager, NetworkCapabilities.TRANSPORT_CELLULAR, startTimeMonth, currentTime)
-            val wMonthly = getSumUsageForTransport(networkStatsManager, NetworkCapabilities.TRANSPORT_WIFI, startTimeMonth, currentTime)
+            val mMonthly = getSumUsageForTransport(NetworkCapabilities.TRANSPORT_CELLULAR, startTimeMonth, currentTime)
+            val wMonthly = getSumUsageForTransport(NetworkCapabilities.TRANSPORT_WIFI, startTimeMonth, currentTime)
 
             val rawMobileBytes = mutableListOf<Long>()
             val rawWifiBytes = mutableListOf<Long>()
@@ -189,8 +200,8 @@ class HomeViewModel(
                     daysList.add(dateFormat.format(cal.time))
                 }
 
-                val mBytes = getSumUsageForTransport(networkStatsManager, NetworkCapabilities.TRANSPORT_CELLULAR, startOfDay, endOfDay)
-                val wBytes = getSumUsageForTransport(networkStatsManager, NetworkCapabilities.TRANSPORT_WIFI, startOfDay, endOfDay)
+                val mBytes = getSumUsageForTransport(NetworkCapabilities.TRANSPORT_CELLULAR, startOfDay, endOfDay)
+                val wBytes = getSumUsageForTransport(NetworkCapabilities.TRANSPORT_WIFI, startOfDay, endOfDay)
 
                 rawMobileBytes.add(mBytes)
                 rawWifiBytes.add(wBytes)
@@ -270,45 +281,66 @@ class HomeViewModel(
                 weeklyDates = datesList
                 weeklyYAxisLabels = labelsList
             }
+
+            refreshInsights(
+                dailyUsedBytes = dailyBytes,
+                dailyPeriodStart = startTimeDay,
+                dailyLimitBytes = if (dataLimitEnabled) dataLimit else 0L,
+                monthlyUsedBytes = monthlyBytes,
+                monthlyPeriodStart = startTimeMonth,
+            )
         }
     }
 
-    // Queries and sums total network usage bytes for a specific transport path.
-    private fun getSumUsageForTransport(manager: NetworkStatsManager, transportType: Int, startTime: Long, endTime: Long): Long {
-        var total = 0L
-        try {
-            val stats = manager.querySummary(transportType, null, startTime, endTime)
-            val bucket = NetworkStats.Bucket()
-            while (stats.hasNextBucket()) {
-                stats.getNextBucket(bucket)
-                total += bucket.rxBytes + bucket.txBytes
-            }
-            stats.close()
-        } catch (_: Exception) {}
-        return total
-    }
-
-    private fun getDeviceUsage(manager: NetworkStatsManager, startTime: Long, endTime: Long): LongArray {
-        var rxTotal = 0L
-        var txTotal = 0L
-        
-        fun sumTransportUsage(transportType: Int) {
+    /**
+     * Recompute the analytics snapshot in the background.
+     *
+     * Runs after the fast usage numbers have already been published to the UI, so the dashboard
+     * never waits on history ingestion or forecasting.
+     */
+    private fun refreshInsights(
+        dailyUsedBytes: Long,
+        dailyPeriodStart: Long,
+        dailyLimitBytes: Long,
+        monthlyUsedBytes: Long,
+        monthlyPeriodStart: Long,
+    ) {
+        insightsJob?.cancel()
+        insightsJob = viewModelScope.launch(Dispatchers.IO) {
             try {
-                val stats = manager.querySummary(transportType, null, startTime, endTime)
-                val bucket = NetworkStats.Bucket()
-                while (stats.hasNextBucket()) {
-                    stats.getNextBucket(bucket)
-                    rxTotal += bucket.rxBytes
-                    txTotal += bucket.txBytes
-                }
-                stats.close()
-            } catch (_: Exception) {}
+                insightsEngine.ingestCompletedHours()
+
+                val monthlyLimitEnabled = repository.dataMonthlyLimitEnabled.first()
+                val monthlyLimit = if (monthlyLimitEnabled) repository.dataMonthlyLimit.first() else 0L
+
+                _insights.value = insightsEngine.compute(
+                    dailyUsedBytes = dailyUsedBytes,
+                    dailyPeriodStart = dailyPeriodStart,
+                    dailyLimitBytes = dailyLimitBytes,
+                    monthlyUsedBytes = monthlyUsedBytes,
+                    monthlyPeriodStart = monthlyPeriodStart,
+                    monthlyLimitBytes = monthlyLimit,
+                )
+            } catch (_: Exception) {
+                // Insights are additive; a failure here must never break the dashboard.
+            }
         }
+    }
 
-        sumTransportUsage(NetworkCapabilities.TRANSPORT_WIFI)
-        sumTransportUsage(NetworkCapabilities.TRANSPORT_CELLULAR)
+    // Queries total network usage for a transport, served from the shared coalescing cache so
+    // the Home screen, the widgets and the monitoring service never duplicate a binder call.
+    private suspend fun getSumUsageForTransport(
+        transportType: Int,
+        startTime: Long,
+        endTime: Long,
+    ): Long = NetworkStatsCache.summary(applicationContext, transportType, startTime, endTime).total
 
-        return longArrayOf(rxTotal, txTotal)
+    private suspend fun getDeviceUsage(
+        startTime: Long,
+        endTime: Long,
+    ): LongArray {
+        val combined = NetworkStatsCache.combined(applicationContext, startTime, endTime)
+        return longArrayOf(combined.rx, combined.tx)
     }
 
     private fun formatDataUsage(bytes: Long): String = SpeedFormatter.formatUsage(bytes)
